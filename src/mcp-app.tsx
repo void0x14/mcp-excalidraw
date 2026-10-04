@@ -527,7 +527,7 @@ function DiagramView({ toolInput, isFinal, displayMode, onElements, editedElemen
       }
     };
     doStream();
-  }, [toolInput, isFinal, renderSvgPreview]);
+  }, [toolInput, isFinal, renderSvgPreview, editedElements]);
 
   // Render already-converted elements directly (skip convertToExcalidrawElements)
   useEffect(() => {
@@ -562,45 +562,45 @@ function DiagramView({ toolInput, isFinal, displayMode, onElements, editedElemen
         const final = wrapper.querySelector("svg");
         if (final) {
           fixViewBox4x3(final as SVGSVGElement);
-          const vbAttr = (final as SVGSVGElement).getAttribute("viewBox")?.split(" ").map(Number);
-          if (vbAttr && vbAttr.length === 4) {
-            baseViewBoxRef.current = { x: vbAttr[0], y: vbAttr[1], w: vbAttr[2], h: vbAttr[3] };
-            applyZoom();
-          }
+          // Keep the same scene-space viewport as the streaming render. Taking the
+          // raw export bounds here would zoom out to the whole scene bounds (e.g.
+          // a large background rectangle), shrinking the diagram to a speck.
+          sceneBoundsRef.current = computeSceneBounds(editedElements);
+          if (!animatedVP.current) animatedVP.current = { x: 0, y: 0, width: 1024, height: 768 };
+          applyViewBox();
         }
       } catch {}
     })();
-  }, [editedElements, applyZoom]);
+  }, [editedElements, applyZoom, applyViewBox]);
 
-  // Zoom: pinch-to-zoom / Ctrl+scroll, pan when zoomed, double-click to reset
+  // Viewport interaction:
+  //   wheel / trackpad          → pan
+  //   Ctrl/Cmd + wheel          → zoom at cursor
+  //   space-drag or middle-drag → pan
+  //   double-click              → reset zoom & pan
   useEffect(() => {
     const container = svgRef.current;
     if (!container) return;
 
     const handleWheel = (e: WheelEvent) => {
-      const isZoomGesture = e.ctrlKey || e.metaKey;
-      const isZoomedIn = Math.abs(zoomRef.current.scale - 1) > 0.01;
-
-      if (!isZoomGesture && !isZoomedIn) return;
+      if (!baseViewBoxRef.current) return;
       e.preventDefault();
 
       const zoom = zoomRef.current;
-      if (isZoomGesture) {
+      const { w, h } = baseViewBoxRef.current;
+
+      if (e.ctrlKey || e.metaKey) {
         const factor = e.deltaY > 0 ? 0.97 : 1.03;
         const newScale = Math.max(0.25, Math.min(8, zoom.scale * factor));
-        if (baseViewBoxRef.current) {
-          const rect = container.getBoundingClientRect();
-          const mx = (e.clientX - rect.left) / rect.width;
-          const my = (e.clientY - rect.top) / rect.height;
-          const { w, h } = baseViewBoxRef.current;
-          zoom.panX += w * (1 / newScale - 1 / zoom.scale) * (0.5 - mx);
-          zoom.panY += h * (1 / newScale - 1 / zoom.scale) * (0.5 - my);
-        }
+        const rect = container.getBoundingClientRect();
+        const mx = (e.clientX - rect.left) / rect.width;
+        const my = (e.clientY - rect.top) / rect.height;
+        zoom.panX += w * (1 / newScale - 1 / zoom.scale) * (0.5 - mx);
+        zoom.panY += h * (1 / newScale - 1 / zoom.scale) * (0.5 - my);
         zoom.scale = newScale;
-      } else if (baseViewBoxRef.current) {
-        const { w, h } = baseViewBoxRef.current;
-        zoom.panX += (e.deltaX / container.clientWidth) * (w / zoom.scale);
-        zoom.panY += (e.deltaY / container.clientHeight) * (h / zoom.scale);
+      } else {
+        zoom.panX += (e.deltaX / Math.max(1, container.clientWidth)) * (w / zoom.scale);
+        zoom.panY += (e.deltaY / Math.max(1, container.clientHeight)) * (h / zoom.scale);
       }
       applyZoom();
     };
@@ -610,11 +610,79 @@ function DiagramView({ toolInput, isFinal, displayMode, onElements, editedElemen
       applyZoom();
     };
 
+    // Space held → pan cursor; drag with space or middle button pans the viewBox.
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    let space = false;
+
+    const isTypingTarget = (t: EventTarget | null) =>
+      !!t && ((t as HTMLElement).tagName === "INPUT" ||
+              (t as HTMLElement).tagName === "TEXTAREA" ||
+              (t as HTMLElement).isContentEditable);
+
+    const syncCursor = () => {
+      if (dragging) container.style.cursor = "grabbing";
+      else if (space) container.style.cursor = "grab";
+      else container.style.cursor = "";
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "Space" && !isTypingTarget(e.target)) { space = true; syncCursor(); }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") { space = false; syncCursor(); }
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (!baseViewBoxRef.current) return;
+      if (!(space || e.button === 1)) return;
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      container.setPointerCapture?.(e.pointerId);
+      syncCursor();
+      e.preventDefault();
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (!dragging || !baseViewBoxRef.current) return;
+      const rect = container.getBoundingClientRect();
+      const { w, h } = baseViewBoxRef.current;
+      const zoom = zoomRef.current;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      zoom.panX -= (dx / Math.max(1, rect.width)) * (w / zoom.scale);
+      zoom.panY -= (dy / Math.max(1, rect.height)) * (h / zoom.scale);
+      applyZoom();
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (!dragging) return;
+      dragging = false;
+      container.releasePointerCapture?.(e.pointerId);
+      syncCursor();
+    };
+
     container.addEventListener("wheel", handleWheel, { passive: false });
     container.addEventListener("dblclick", handleDblClick);
+    container.addEventListener("pointerdown", onPointerDown);
+    container.addEventListener("pointermove", onPointerMove);
+    container.addEventListener("pointerup", onPointerUp);
+    container.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
     return () => {
       container.removeEventListener("wheel", handleWheel);
       container.removeEventListener("dblclick", handleDblClick);
+      container.removeEventListener("pointerdown", onPointerDown);
+      container.removeEventListener("pointermove", onPointerMove);
+      container.removeEventListener("pointerup", onPointerUp);
+      container.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
     };
   }, [applyZoom]);
 
@@ -692,10 +760,19 @@ export function ExcalidrawAppCore({ app }: { app: App }) {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && displayMode === "fullscreen") toggleFullscreen();
+      if (e.key !== "Escape" || displayMode !== "fullscreen") return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      // Let Excalidraw close its own overlays first (modal, context menu).
+      // Only classes Excalidraw mounts while actually open are checked here:
+      // [role='dialog'] is NOT usable — .color-picker-container carries it and
+      // stays mounted (and measurable) even when closed.
+      const root = document.querySelector(".excalidraw");
+      if (root && root.querySelector(".Modal, .Dialog, .context-menu, .dropdown-menu")) return;
+      toggleFullscreen();
     };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+    document.addEventListener("keydown", handler, true);
+    return () => document.removeEventListener("keydown", handler, true);
   }, [displayMode, toggleFullscreen]);
 
   // Preload ALL Excalidraw fonts on first mount (inline mode) so they're
@@ -816,10 +893,19 @@ export function ExcalidrawAppCore({ app }: { app: App }) {
     app.ontoolresult = (result: any) => {
       const cpId = (result.structuredContent as { checkpointId?: string })?.checkpointId;
       if (cpId) {
+        const prev = checkpointIdRef.current;
         checkpointIdRef.current = cpId;
         setCheckpointId(cpId);
         // Use checkpointId as localStorage key for persisting user edits
         setStorageKey(cpId);
+        // A different checkpoint is a different diagram. Drop edits carried over
+        // from the previous one, otherwise the stale userEdits state suppresses
+        // rendering of the new scene entirely.
+        if (prev && prev !== cpId) {
+          setUserEdits(null);
+          setElements([]);
+          elementsRef.current = [];
+        }
         // Check for persisted edits from a previous fullscreen session
         const persisted = loadPersistedElements();
         if (persisted && persisted.length > 0) {

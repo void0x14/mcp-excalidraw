@@ -7,9 +7,96 @@ import path from "node:path";
 import { deflateSync } from "node:zlib";
 import { z } from "zod/v4";
 import type { CheckpointStore } from "./checkpoint-store.js";
+import { elementsToSvg } from "./terminal-render.js";
 
 /** Maximum allowed size for element/data input strings (5 MB). */
 const MAX_INPUT_BYTES = 5 * 1024 * 1024;
+
+/** Builds a standard .excalidraw scene object from drawable elements. */
+function toScene(elements: any[]): string {
+  return JSON.stringify({
+    type: "excalidraw",
+    version: 2,
+    source: "excalidraw-mcp",
+    elements: drawable(elements),
+    appState: { gridSize: null, viewBackgroundColor: "#ffffff" },
+    files: {},
+  });
+}
+
+/** Drops pseudo-elements and deleted items. */
+function drawable(elements: any[]): any[] {
+  return elements.filter(
+    (el: any) => el && el.type !== "cameraUpdate" && el.type !== "delete" && !el.isDeleted,
+  );
+}
+
+/**
+ * Uploads a serialized .excalidraw scene to excalidraw.com and returns a
+ * shareable URL. Anonymous — no account, no auth.
+ */
+async function uploadToExcalidraw(remappedJson: string): Promise<string> {
+  // concatBuffers: [version=1 (4B)] [len₁ (4B)] [data₁] [len₂ (4B)] [data₂] ...
+  const concatBuffers = (...bufs: Uint8Array[]): Uint8Array => {
+    let total = 4; // version header
+    for (const b of bufs) total += 4 + b.length;
+    const out = new Uint8Array(total);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(0, 1); // CONCAT_BUFFERS_VERSION = 1
+    let off = 4;
+    for (const b of bufs) {
+      dv.setUint32(off, b.length);
+      off += 4;
+      out.set(b, off);
+      off += b.length;
+    }
+    return out;
+  };
+  const te = new TextEncoder();
+
+  // 1. Inner payload: concatBuffers(fileMetadata, data)
+  const fileMetadata = te.encode(JSON.stringify({}));
+  const dataBytes = te.encode(remappedJson);
+  const innerPayload = concatBuffers(fileMetadata, dataBytes);
+
+  // 2. Compress inner payload with zlib deflate
+  const compressed = deflateSync(Buffer.from(innerPayload));
+
+  // 3. Generate AES-GCM 128-bit key + encrypt
+  const cryptoKey = await globalThis.crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 128 },
+    true,
+    ["encrypt"],
+  );
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await globalThis.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    cryptoKey,
+    compressed,
+  );
+
+  // 4. Encoding metadata (tells excalidraw.com how to decode)
+  const encodingMeta = te.encode(JSON.stringify({
+    version: 2,
+    compression: "pako@1",
+    encryption: "AES-GCM",
+  }));
+
+  // 5. Outer payload: concatBuffers(encodingMeta, iv, encryptedData)
+  const payload = Buffer.from(concatBuffers(encodingMeta, iv, new Uint8Array(encrypted)));
+
+  // 6. Upload to excalidraw backend
+  const res = await fetch("https://json.excalidraw.com/api/v2/post/", {
+    method: "POST",
+    body: payload,
+  });
+  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+  const { id } = (await res.json()) as { id: string };
+
+  // 7. Export key as base64url string
+  const jwk = await globalThis.crypto.subtle.exportKey("jwk", cryptoKey);
+  return `https://excalidraw.com/#json=${id},${jwk.k}`;
+}
 
 // Works both from source (src/server.ts) and compiled (dist/server.js)
 const DIST_DIR = import.meta.filename.endsWith(".ts")
@@ -494,16 +581,19 @@ Call read_me first to learn the element format.`,
 
       const checkpointId = crypto.randomUUID().replace(/-/g, "").slice(0, 18);
       await store.save(checkpointId, { elements: resolvedElements });
+      const scene = toScene(resolvedElements);
       return {
-        content: [{ type: "text", text: `Diagram displayed! Checkpoint id: "${checkpointId}".
-If user asks to create a new diagram - simply create a new one from scratch.
-However, if the user wants to edit something on this diagram "${checkpointId}", take these steps:
-1) read widget context (using read_widget_context tool) to check if user made any manual edits first
-2) decide whether you want to make new diagram from scratch OR - use this one as starting checkpoint:
-  simply start from the first element [{"type":"restoreCheckpoint","id":"${checkpointId}"}, ...your new elements...]
-  this will use same diagram state as the user currently sees, including any manual edits they made in fullscreen, allowing you to add elements on top.
-  To remove elements, use: {"type":"delete","ids":"<id1>,<id2>"}${ratioHint}` }],
-        structuredContent: { checkpointId },
+        content: [{ type: "text", text: `Diagram rendered. Checkpoint id: "${checkpointId}".
+
+This diagram is a saved checkpoint. To keep working on it, pass it as the FIRST element and add new elements after it:
+  [{"type":"restoreCheckpoint","id":"${checkpointId}"}, ...your new elements...]
+This reuses the current diagram state, so your additions land on top instead of replacing it.
+To remove elements, use: {"type":"delete","ids":"<id1>,<id2>"}
+To replace the diagram entirely, just call create_view again with fresh elements.
+
+IMPORTANT — if this host does not render the widget (terminal/TUI), the user sees nothing yet. In that case call show_diagram with these same elements to open the real Excalidraw renderer in a browser window:
+  show_diagram(elements=<the same JSON>)${ratioHint}` }],
+        structuredContent: { checkpointId, scene },
       };
     },
   );
@@ -527,69 +617,7 @@ However, if the user wants to edit something on this diagram "${checkpointId}", 
         };
       }
       try {
-        // --- Excalidraw v2 binary format ---
-        const remappedJson = json;
-        // concatBuffers: [version=1 (4B)] [len₁ (4B)] [data₁] [len₂ (4B)] [data₂] ...
-        const concatBuffers = (...bufs: Uint8Array[]): Uint8Array => {
-          let total = 4; // version header
-          for (const b of bufs) total += 4 + b.length;
-          const out = new Uint8Array(total);
-          const dv = new DataView(out.buffer);
-          dv.setUint32(0, 1); // CONCAT_BUFFERS_VERSION = 1
-          let off = 4;
-          for (const b of bufs) {
-            dv.setUint32(off, b.length);
-            off += 4;
-            out.set(b, off);
-            off += b.length;
-          }
-          return out;
-        };
-        const te = new TextEncoder();
-
-        // 1. Inner payload: concatBuffers(fileMetadata, data)
-        const fileMetadata = te.encode(JSON.stringify({}));
-        const dataBytes = te.encode(remappedJson);
-        const innerPayload = concatBuffers(fileMetadata, dataBytes);
-
-        // 2. Compress inner payload with zlib deflate
-        const compressed = deflateSync(Buffer.from(innerPayload));
-
-        // 3. Generate AES-GCM 128-bit key + encrypt
-        const cryptoKey = await globalThis.crypto.subtle.generateKey(
-          { name: "AES-GCM", length: 128 },
-          true,
-          ["encrypt"],
-        );
-        const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-        const encrypted = await globalThis.crypto.subtle.encrypt(
-          { name: "AES-GCM", iv },
-          cryptoKey,
-          compressed,
-        );
-
-        // 4. Encoding metadata (tells excalidraw.com how to decode)
-        const encodingMeta = te.encode(JSON.stringify({
-          version: 2,
-          compression: "pako@1",
-          encryption: "AES-GCM",
-        }));
-
-        // 5. Outer payload: concatBuffers(encodingMeta, iv, encryptedData)
-        const payload = Buffer.from(concatBuffers(encodingMeta, iv, new Uint8Array(encrypted)));
-
-        // 5. Upload to excalidraw backend
-        const res = await fetch("https://json.excalidraw.com/api/v2/post/", {
-          method: "POST",
-          body: payload,
-        });
-        if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-        const { id } = (await res.json()) as { id: string };
-
-        // 6. Export key as base64url string
-        const jwk = await globalThis.crypto.subtle.exportKey("jwk", cryptoKey);
-        const url = `https://excalidraw.com/#json=${id},${jwk.k}`;
-
+        const url = await uploadToExcalidraw(json);
         return { content: [{ type: "text", text: url }] };
       } catch (err) {
         return {
@@ -597,6 +625,73 @@ However, if the user wants to edit something on this diagram "${checkpointId}", 
           isError: true,
         };
       }
+    },
+  );
+
+  // ============================================================
+  // Tool 6: export_scene (MODEL-VISIBLE — headless/TUI fallback)
+  // ------------------------------------------------------------
+  // The widget tools above are app-only: hosts that do not render MCP Apps
+  // (terminal TUIs) never see them. This tool is callable by the model and
+  // returns both a shareable excalidraw.com URL and an optional on-disk
+  // .excalidraw file, so a diagram is never a dead end on a TUI.
+  // ============================================================
+  server.registerTool(
+    "export_scene",
+    {
+      description: `Exports Excalidraw elements to a shareable https://excalidraw.com URL and optionally writes a .excalidraw file to disk.
+Use this when the host does not render the create_view widget (terminal TUIs) — it is the way to hand the user a diagram they can actually open.
+Pass the SAME elements JSON you passed to create_view.`,
+      inputSchema: {
+        elements: z.string().describe("JSON array string of Excalidraw elements (same format as create_view)."),
+        path: z.string().optional().describe("Optional absolute or relative file path to write the .excalidraw scene to. Parent directories are created."),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ elements, path: outPath }): Promise<CallToolResult> => {
+      if (elements.length > MAX_INPUT_BYTES) {
+        return {
+          content: [{ type: "text", text: `Elements input exceeds ${MAX_INPUT_BYTES} byte limit.` }],
+          isError: true,
+        };
+      }
+      let parsed: any[];
+      try {
+        parsed = JSON.parse(elements);
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `Invalid JSON in elements: ${(e as Error).message}` }],
+          isError: true,
+        };
+      }
+      if (!Array.isArray(parsed)) {
+        return { content: [{ type: "text", text: "elements must be a JSON array." }], isError: true };
+      }
+
+      const scene = toScene(parsed);
+      const lines: string[] = [];
+
+      try {
+        const url = await uploadToExcalidraw(scene);
+        lines.push(`Shareable URL: ${url}`);
+      } catch (err) {
+        lines.push(`Upload failed: ${(err as Error).message}`);
+      }
+
+      if (outPath) {
+        try {
+          const abs = path.resolve(outPath);
+          await fs.mkdir(path.dirname(abs), { recursive: true });
+          await fs.writeFile(abs, scene, "utf-8");
+          lines.push(`File written: ${abs}`);
+        } catch (err) {
+          lines.push(`File write failed: ${(err as Error).message}`);
+        }
+      }
+
+      lines.push(`Scene: ${scene.length} bytes, ${parsed.length} element(s).`);
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 
@@ -644,6 +739,136 @@ However, if the user wants to edit something on this diagram "${checkpointId}", 
       } catch (err) {
         return { content: [{ type: "text", text: `read failed: ${(err as Error).message}` }], isError: true };
       }
+    },
+  );
+
+  // ============================================================
+  // Tool 9: show_inline (MODEL-VISIBLE — image into the terminal itself)
+  // ------------------------------------------------------------
+  // grok's TUI does not render images that arrive as tool results: it emits
+  // only kitty "delete" commands for them. It DOES render an image the user
+  // pastes into the prompt, transmitting it with the kitty graphics protocol
+  // (ESC_G a=T,f=100,...;<base64 png>). This tool renders the diagram to PNG
+  // and places it on the clipboard, so pasting (Ctrl+V) draws it in the TUI.
+  // ============================================================
+  server.registerTool(
+    "show_inline",
+    {
+      description: `Renders the diagram as a PNG and puts it on the clipboard so it can be pasted straight into the terminal prompt (Ctrl+V), where grok draws it with the kitty graphics protocol.
+
+Terminal TUIs do not draw images returned from tools, but they DO draw an image pasted into the prompt. Use this when the user wants the diagram inside the terminal.
+
+After calling it, tell the user to press Ctrl+V in the prompt.`,
+      inputSchema: {
+        elements: z.string().describe("JSON array string of Excalidraw elements (same format as create_view)."),
+        width: z.number().int().min(200).max(4000).optional().describe("PNG width in pixels. Defaults to 1200."),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ elements, width }): Promise<CallToolResult> => {
+      if (elements.length > MAX_INPUT_BYTES) {
+        return { content: [{ type: "text", text: `Elements input exceeds ${MAX_INPUT_BYTES} byte limit.` }], isError: true };
+      }
+      let parsed: any[];
+      try {
+        parsed = JSON.parse(elements);
+      } catch (e) {
+        return { content: [{ type: "text", text: `Invalid JSON in elements: ${(e as Error).message}` }], isError: true };
+      }
+      if (!Array.isArray(parsed)) {
+        return { content: [{ type: "text", text: "elements must be a JSON array." }], isError: true };
+      }
+
+      const svg = elementsToSvg(parsed);
+      const outPng = "/tmp/excalidraw-inline.png";
+      try {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const run = promisify(execFile);
+        const svgPath = "/tmp/excalidraw-inline.svg";
+        await fs.writeFile(svgPath, svg, "utf-8");
+        await run("rsvg-convert", ["-w", String(width ?? 1200), svgPath, "-o", outPng]);
+        // put it on the clipboard so the user can paste it into the prompt
+        const script = `${process.env.HOME}/.local/bin/grokimg ${outPng} --clip`;
+        await run("bash", ["-lc", script], { timeout: 20000 });
+      } catch (err) {
+        return { content: [{ type: "text", text: `Inline render failed: ${(err as Error).message}` }], isError: true };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Diagram is on the clipboard as PNG (${outPng}).\nPress Ctrl+V in the prompt to paste it — grok will draw it inline with the kitty graphics protocol.`,
+        }],
+      };
+    },
+  );
+
+  // ============================================================
+  // Tool 8: show_diagram (MODEL-VISIBLE — real Excalidraw in a browser)
+  // ------------------------------------------------------------
+  // Terminal TUIs (grok CLI, opencode) never render the MCP App widget and
+  // swallow kitty/sixel escapes, so a diagram cannot be drawn in the terminal
+  // itself. This tool serves the real widget HTML and opens it in the user's
+  // browser, where Excalidraw renders natively.
+  // ============================================================
+  server.registerTool(
+    "show_diagram",
+    {
+      description: `Opens the diagram in the real Excalidraw renderer (browser window).
+
+Use this whenever the user should SEE the diagram. Terminal TUIs cannot draw
+Excalidraw: the widget never renders there and image escapes are swallowed.
+This serves the actual Excalidraw MCP App and opens it in the user's browser.
+
+Pass the SAME elements JSON you passed to create_view.`,
+      inputSchema: {
+        elements: z.string().describe("JSON array string of Excalidraw elements (same format as create_view)."),
+        path: z.string().optional().describe("Optional path to also save the .excalidraw scene."),
+      },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ elements, path: outPath }): Promise<CallToolResult> => {
+      if (elements.length > MAX_INPUT_BYTES) {
+        return { content: [{ type: "text", text: `Elements input exceeds ${MAX_INPUT_BYTES} byte limit.` }], isError: true };
+      }
+      let parsed: any[];
+      try {
+        parsed = JSON.parse(elements);
+      } catch (e) {
+        return { content: [{ type: "text", text: `Invalid JSON in elements: ${(e as Error).message}` }], isError: true };
+      }
+      if (!Array.isArray(parsed)) {
+        return { content: [{ type: "text", text: "elements must be a JSON array." }], isError: true };
+      }
+
+      const scene = toScene(parsed);
+      const lines: string[] = [];
+
+      // Persist the scene so the viewer can pick it up, then launch the viewer.
+      const scenePath = outPath ? path.resolve(outPath) : "/tmp/excalidraw-latest.excalidraw";
+      try {
+        await fs.mkdir(path.dirname(scenePath), { recursive: true });
+        await fs.writeFile(scenePath, scene, "utf-8");
+        lines.push(`Scene written: ${scenePath}`);
+      } catch (err) {
+        lines.push(`Scene write failed: ${(err as Error).message}`);
+      }
+
+      try {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const run = promisify(execFile);
+        // Prefer a viewer on PATH; fall back to the copy shipped in this repo.
+        const bundled = path.resolve(import.meta.dirname, "..", "tools", "excali-view");
+        const viewer = process.env.EXCALI_VIEW || (await fs.access(bundled).then(() => bundled, () => "excali-view"));
+        const { stdout } = await run(viewer, [scenePath], { timeout: 15000 });
+        lines.push(`Viewer: ${stdout.trim()}`);
+      } catch (err) {
+        lines.push(`Viewer launch failed: ${(err as Error).message}`);
+      }
+
+      lines.push(`Scene: ${scene.length} bytes, ${parsed.length} element(s).`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 

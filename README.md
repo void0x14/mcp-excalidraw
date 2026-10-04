@@ -61,6 +61,54 @@ Text responses can only go so far. Sometimes users need to interact with data, n
 
 PRs welcome! See [Local](#local) above for build instructions.
 
+## Fork: local viewer fixes
+
+This fork (`void0x14/mcp-excalidraw`) fixes the local browser viewer used by
+`show_diagram`, where the canvas could not be panned or zoomed and both
+**Edit** and **Open in Excalidraw** did nothing.
+
+### What was broken
+
+The viewer (`tools/excali-view`) acts as the MCP App **host**. It answered the
+widget's JSON-RPC with stubs:
+
+| Widget request | Old reply | Effect |
+| --- | --- | --- |
+| `ui/open-link` | `{}` | link never opened |
+| `ui/request-display-mode` | `{}` | SDK schema requires `{mode}` → parse error → Edit dead |
+| `tools/call` | `"ok"` | `export_to_excalidraw` never ran |
+
+Separately, the inline SVG preview only supported Ctrl+wheel zoom and returned
+early at scale 1, so a plain wheel did nothing and there was no drag-to-pan.
+
+### Fixes
+
+**`tools/excali-view`** — real host:
+
+- `ui/open-link` → opens the URL (`xdg-open`), logged to `/tmp/excali-view/opened-urls.log`
+- `ui/request-display-mode` → returns `{mode}` and makes the iframe fullscreen
+- `tools/call` → forwarded to a real stdio MCP server (`dist/index.js --stdio`)
+- `/scene` returns `{elements, checkpointId}`; the checkpoint id is derived from
+  the scene content, so a new diagram gets its own localStorage edit cache
+
+**`src/mcp-app.tsx`** — viewport interaction:
+
+- plain wheel / trackpad → pan
+- Ctrl/Cmd + wheel → zoom at cursor
+- space-drag or middle-drag → pan
+- double-click → reset zoom and pan
+- a changed `checkpointId` clears stale user edits, so a new diagram renders
+- after editing, the inline view keeps the scene-space viewport instead of
+  collapsing to the raw export bounds
+- Escape exits fullscreen (capture phase; visible Excalidraw overlays win first)
+
+### Verified
+
+Playwright against `http://127.0.0.1:8765/` with a 34-element scene: wheel pan,
+Ctrl+wheel zoom, space-drag, double-click reset, Edit → full Excalidraw editor
+→ draw → checkpoint written (45 elements), and Open in Excalidraw → a real
+`https://excalidraw.com/#json=...` link that opens the editable scene.
+
 ### Deploy your own instance
 
 You can deploy your own copy to Vercel in a few clicks:

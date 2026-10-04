@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""excali-view — Excalidraw MCP App widget'ini tarayicida acar ve diyagrami gosterir.
+
+Kullanim:
+  excali-view <dosya.excalidraw>   # viewer'i baslat (veya guncelle) + diyagrami goster
+  excali-view --stop               # viewer'i durdur
+
+Neden gerekli: grok CLI ve opencode TUI, MCP App widget HTML'ini render etmez
+(mcpApps=false) ve terminal grafik protokollerini yutar. Widget'in kendisi
+tarayicida sorunsuz cizilir; bu betik onu oraya tasir.
+
+Host gorevi: widget bir MCP App'tir ve pan/zoom/duzenleme/export icin HOST'a
+JSON-RPC gonderir. Bu betik o host'u gercekten uygular:
+  - ui/open-link              -> xdg-open ile URL acar
+  - ui/request-display-mode   -> {mode} doner, iframe'i tam ekrana alir
+  - tools/call                -> gercek MCP server'a (stdio) iletilir
+                                 (export_to_excalidraw, read_checkpoint, save_checkpoint)
+Onceki surum bu metotlara bos {} / sabit "ok" donuyordu; bu yuzden
+"Open in Excalidraw" ve "Edit" calismiyordu.
+
+Viewer tek surectir ve sahneyi her istekte diskten okur; bu yuzden ajan yeni bir
+diyagram urettiginde pencere kendiliginden guncellenir (sayfa /scene'i yoklar).
+"""
+import hashlib
+import http.server
+import json
+import os
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+# Repo root: this script lives in <repo>/tools/. Allow an override so a copy
+# installed elsewhere (~/.local/bin/excali-view) can point at the real checkout.
+REPO = os.environ.get("EXCALIDRAW_MCP_REPO") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
+WIDGET = os.path.join(REPO, "dist/mcp-app.html")
+SERVER = os.path.join(REPO, "dist/index.js")
+SCENE = os.environ.get("EXCALI_SCENE") or "/tmp/excalidraw-latest.excalidraw"
+PORT = int(os.environ.get("EXCALI_PORT") or 8765)
+VIEWDIR = os.environ.get("EXCALI_VIEW_DIR") or "/tmp/excali-view"
+PIDFILE = os.path.join(VIEWDIR, "viewer.pid")
+PORTFILE = os.path.join(VIEWDIR, "port")
+OPENLOG = os.path.join(VIEWDIR, "opened-urls.log")
+MCPLOG = os.path.join(VIEWDIR, "mcp-stderr.log")
+
+
+def ensure_dir():
+    os.makedirs(VIEWDIR, exist_ok=True)
+
+
+def find_port(start=PORT):
+    for p in range(start, start + 50):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", p)) != 0:
+                return p
+    raise SystemExit("bos port bulunamadi")
+
+
+# ============================================================
+# MCP stdio client — widget'in tools/call isteklerini gercek sunucuya iletir
+# ============================================================
+class McpClient:
+    def __init__(self):
+        node = None
+        for c in ("node", "/usr/bin/node", "/usr/local/bin/node"):
+            if os.path.sep in c:
+                if os.path.exists(c):
+                    node = c
+                    break
+            else:
+                from shutil import which
+                node = which(c)
+                if node:
+                    break
+        if not node:
+            raise RuntimeError("node bulunamadi")
+        ensure_dir()
+        self._log = open(MCPLOG, "ab")
+        self.proc = subprocess.Popen(
+            [node, SERVER, "--stdio"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
+            text=True, bufsize=1, cwd=REPO,
+        )
+        self.lock = threading.Lock()
+        self.pending = {}
+        self._id = 0
+        threading.Thread(target=self._reader, daemon=True).start()
+        self._request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "excali-view", "version": "1.1.0"},
+        })
+        self._notify("notifications/initialized", {})
+
+    def _reader(self):
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                mid = msg.get("id")
+                if mid is not None and mid in self.pending:
+                    self.pending[mid].append(msg)
+        except Exception:
+            pass
+
+    def _write(self, obj):
+        self.proc.stdin.write(json.dumps(obj) + "\n")
+        self.proc.stdin.flush()
+
+    def _request(self, method, params, timeout=90):
+        with self.lock:
+            self._id += 1
+            mid = self._id
+            q = []
+            self.pending[mid] = q
+            self._write({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+            deadline = time.time() + timeout
+            while not q and time.time() < deadline and self.proc.poll() is None:
+                time.sleep(0.01)
+            self.pending.pop(mid, None)
+            if not q:
+                raise TimeoutError(f"{method} zaman asimi")
+            return q[0]
+
+    def _notify(self, method, params):
+        with self.lock:
+            self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def call_tool(self, name, arguments):
+        resp = self._request("tools/call", {"name": name, "arguments": arguments or {}})
+        if "error" in resp:
+            return {"content": [{"type": "text", "text": str(resp["error"].get("message", resp["error"]))}],
+                    "isError": True}
+        return resp.get("result", {})
+
+
+_mcp_lock = threading.Lock()
+_mcp = None
+
+
+def _reset_mcp():
+    global _mcp
+    with _mcp_lock:
+        if _mcp is not None:
+            try:
+                _mcp.proc.kill()
+            except Exception:
+                pass
+        _mcp = None
+
+
+def call_mcp(name, arguments):
+    """Forward a tools/call to the stdio MCP server; respawn once on failure."""
+    global _mcp
+    last = None
+    for attempt in (0, 1):
+        try:
+            with _mcp_lock:
+                if _mcp is None:
+                    _mcp = McpClient()
+                client = _mcp
+            return client.call_tool(name, arguments)
+        except Exception as e:
+            last = e
+            _reset_mcp()
+            if attempt == 0:
+                time.sleep(0.3)
+    return {"content": [{"type": "text", "text": f"mcp-call failed: {last}"}], "isError": True}
+
+
+# ============================================================
+# Scene
+# ============================================================
+def read_scene():
+    """Sahne elementlerini ve sahneye ozgu checkpoint id'sini dondurur.
+
+    checkpointId sahne iceriginden turetilir; boylece widget'in localStorage
+    duzenleme onbellegi diyagram basina ayrilir (sabit "viewer" anahtari
+    yeni diyagramlari eski duzenlemelerle eziyordu).
+    """
+    try:
+        raw = open(SCENE, "rb").read()
+        d = json.loads(raw)
+    except Exception:
+        return None
+    els = d.get("elements", [])
+    cp = hashlib.sha256(raw).hexdigest()[:18]
+    return json.dumps({"elements": els, "checkpointId": cp})
+
+
+def open_url(url):
+    ensure_dir()
+    with open(OPENLOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {url}\n")
+    opener = "xdg-open"
+    if os.environ.get("WAYLAND_DISPLAY") and os.path.exists("/usr/bin/xdg-open"):
+        opener = "/usr/bin/xdg-open"
+    subprocess.Popen([opener, url],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Excalidraw</title>
+<style>
+  html,body{margin:0;height:100%;background:#1e1e1e;font-family:system-ui}
+  #bar{height:38px;display:flex;align-items:center;gap:10px;padding:0 12px;
+       background:#2b2b2b;color:#ddd;font-size:13px}
+  #bar b{color:#a5d8ff}
+  iframe{border:0;width:100%;height:calc(100% - 38px);background:#fff}
+  #hint{color:#888;font-size:12px}
+  body.fs #bar{display:none}
+  body.fs iframe{height:100%}
+</style></head>
+<body>
+<div id="bar"><b>Excalidraw</b><span id="hint">bekleniyor</span></div>
+<iframe id="w" src="/widget"></iframe>
+<script>
+const frame = document.getElementById('w');
+const hint = document.getElementById('hint');
+let ready = false, sent = null, lastSig = null;
+
+function rpc(id, result, error) {
+  const msg = {jsonrpc:"2.0", id};
+  if (error) msg.error = error; else msg.result = result;
+  frame.contentWindow.postMessage(msg, "*");
+}
+
+function setFullscreen(on) {
+  document.body.classList.toggle('fs', on);
+  frame.contentWindow.postMessage({
+    jsonrpc:"2.0", method:"ui/notifications/host-context-changed",
+    params:{ displayMode: on ? "fullscreen" : "inline",
+             containerDimensions:{ height: window.innerHeight } }
+  }, "*");
+}
+
+window.addEventListener('message', async (e) => {
+  const m = e.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+
+  if (m.method === "ui/initialize") {
+    ready = true;
+    rpc(m.id, {
+      protocolVersion: "2025-06-18",
+      hostInfo: { name: "excali-view", version: "1.1.0" },
+      hostCapabilities: { openLinks: {}, serverTools: {}, logging: {} },
+      hostContext: {
+        displayMode: "inline",
+        platform: "desktop",
+        containerDimensions: { height: Math.max(300, window.innerHeight - 38) }
+      }
+    });
+    poll();
+    return;
+  }
+
+  if (m.method === "ui/request-display-mode") {
+    const mode = (m.params && m.params.mode) || "inline";
+    setFullscreen(mode === "fullscreen");
+    rpc(m.id, { mode });
+    return;
+  }
+
+  if (m.method === "ui/open-link") {
+    try {
+      const r = await fetch('/open-link', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(m.params || {})
+      });
+      rpc(m.id, { isError: !r.ok });
+    } catch (err) { rpc(m.id, { isError: true }); }
+    return;
+  }
+
+  if (m.method === "tools/call") {
+    try {
+      const r = await fetch('/mcp-call', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(m.params || {})
+      });
+      rpc(m.id, await r.json());
+    } catch (err) {
+      rpc(m.id, { content:[{type:"text", text:String(err)}], isError:true });
+    }
+    return;
+  }
+
+  if (m.method && m.method.startsWith("ui/")) {
+    if (m.id !== undefined) rpc(m.id, {});
+  }
+});
+
+function draw(els, cpId) {
+  frame.contentWindow.postMessage({
+    jsonrpc:"2.0", method:"ui/notifications/tool-input",
+    params: { arguments: { elements: els } }
+  }, "*");
+  frame.contentWindow.postMessage({
+    jsonrpc:"2.0", method:"ui/notifications/tool-result",
+    params: { structuredContent: { checkpointId: cpId || "viewer" } }
+  }, "*");
+  sent = els;
+  hint.textContent = "diyagram yuklendi";
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/scene', {cache:'no-store'});
+    const t = await r.text();
+    if (t && t !== 'null' && t !== lastSig) {
+      lastSig = t;
+      const d = JSON.parse(t);
+      draw(d.elements, d.checkpointId);
+    }
+  } catch (e) {}
+  setTimeout(poll, 1000);
+}
+</script></body></html>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, body, ctype):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def do_POST(self):
+        if self.path.startswith("/open-link"):
+            p = self._body()
+            url = p.get("url") or ""
+            if not url.startswith(("http://", "https://")):
+                return self._json({"isError": True}, 400)
+            try:
+                open_url(url)
+                return self._json({"isError": False})
+            except Exception as e:
+                return self._json({"isError": True, "error": str(e)}, 500)
+
+        if self.path.startswith("/mcp-call"):
+            p = self._body()
+            name = p.get("name")
+            if not name:
+                return self._json({"content": [{"type": "text", "text": "missing tool name"}], "isError": True}, 400)
+            try:
+                return self._json(call_mcp(name, p.get("arguments")))
+            except Exception as e:
+                return self._json({"content": [{"type": "text", "text": f"mcp-call failed: {e}"}], "isError": True}, 500)
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_GET(self):
+        if self.path.startswith("/widget"):
+            try:
+                self._send(open(WIDGET, "rb").read(), "text/html; charset=utf-8")
+            except OSError as e:
+                self.send_error(500, str(e))
+            return
+        if self.path.startswith("/scene"):
+            self._send(read_scene() or "null", "application/json")
+            return
+        self._send(PAGE, "text/html; charset=utf-8")
+
+
+def is_running():
+    """Yalnizca kendi viewer'imizi tanir: pid + port dosyasi + canli soket."""
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        port = int(open(PORTFILE).read().strip())
+    except Exception:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    with socket.socket() as s:
+        if s.connect_ex(("127.0.0.1", port)) != 0:
+            return None
+    return (pid, port)
+
+
+def main():
+    ensure_dir()
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    if "--stop" in sys.argv:
+        live = is_running()
+        if live:
+            os.kill(live[0], 15)
+            for f in (PIDFILE, PORTFILE):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+            print("durduruldu")
+        else:
+            print("calismiyor")
+        return
+
+    # her cagride sahneyi guncelle
+    if args:
+        src = args[0]
+        if os.path.abspath(src) != SCENE:
+            d = json.load(open(src))
+            json.dump(d, open(SCENE, "w"))
+    else:
+        # viewer'in guncel sahneyi gormesi icin dosyayi tazele
+        if not os.path.exists(SCENE):
+            raise SystemExit("kullanim: excali-view <dosya.excalidraw>")
+
+    live = is_running()
+    if live:
+        print(f"http://127.0.0.1:{live[1]}/")
+        return
+
+    port = find_port()
+
+    class ReuseServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    srv = ReuseServer(("127.0.0.1", port), Handler)
+    pid = os.fork()
+    if pid:
+        ensure_dir()
+        open(PIDFILE, "w").write(str(pid))
+        open(PORTFILE, "w").write(str(port))
+        time.sleep(1.0)
+        url = f"http://127.0.0.1:{port}/"
+        print(url)
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            subprocess.Popen(["xdg-open", url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    os.setsid()
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
