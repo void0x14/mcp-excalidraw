@@ -109,6 +109,13 @@ Ctrl+wheel zoom, space-drag, double-click reset, Edit → full Excalidraw editor
 → draw → checkpoint written (45 elements), and Open in Excalidraw → a real
 `https://excalidraw.com/#json=...` link that opens the editable scene.
 
+| Screenshot | Shows |
+| --- | --- |
+| `docs/evidence/01-edit-fullscreen.png` | Edit opens the real Excalidraw editor |
+| `docs/evidence/03-zoom-in.png` | Ctrl+wheel zoom, diagram legible |
+| `docs/evidence/04-excalidraw-com-edited-scene.png` | exported link opens the editable scene on excalidraw.com |
+| `docs/evidence/05-new-diagram-after-edit.png` | a new diagram (new checkpointId) replaces the edited one |
+
 ### Deploy your own instance
 
 You can deploy your own copy to Vercel in a few clicks:
